@@ -1,0 +1,137 @@
+# Build a Technical SEO Health Dashboard (Streamlit + Lumar GraphQL API)
+
+Build a **single-file Streamlit app (`app.py`)** that reads crawl data from the **Lumar (formerly Deepcrawl) GraphQL API** and shows a scored technical SEO health report. It must work for **one crawl or many**. With one or two projects it should feel like a simple single-site dashboard. With more, it adds a portfolio view.
+
+Read the whole spec first. Use the exact names, thresholds and weights given. The app is **local, single-user and read-only** (GraphQL `query` only, never mutations).
+
+## 1. Setup
+
+- Python 3.10+, `streamlit`, `pandas`, `requests`. `altair` and `matplotlib` are optional, so degrade gracefully without them.
+- Files: `app.py`, `requirements.txt`, `.streamlit/secrets.toml`, `.streamlit/config.toml`.
+- `secrets.toml` holds the API key and the project list, so no IDs live in the code:
+  ```toml
+  [lumar]
+  api_key = "YOUR_LUMAR_API_KEY"
+
+  [[projects]]
+  name = "My Site"
+  project_id = "YOUR_PROJECT_ID"
+  group = ""            # optional tag, e.g. brand or region
+
+  # add more [[projects]] blocks if you have more than one
+  ```
+- `config.toml`: bind to `127.0.0.1`, `headless = true`, `enableXsrfProtection = true`, `gatherUsageStats = false`, `showErrorDetails = false`. Explain in a comment that Streamlit binds to `0.0.0.0` by default, which would expose the key to the local network.
+- If the key or projects are missing, show setup instructions with `st.error` and call `st.stop()`.
+
+## 2. API layer
+
+- Endpoint: `https://api.lumar.io/graphql` (hardcoded). Headers: `x-api-key` and `Content-Type: application/json`.
+- Read the key on the main thread only. Worker threads never touch `st.secrets`.
+- Use one shared `requests.Session` (`@st.cache_resource`) and a thread-safe token-bucket rate limiter (about 18 requests/sec).
+- `api_post(payload)` retries with exponential backoff and jitter on network errors, 429 and 5xx. It returns parsed JSON **without raising on GraphQL `errors`** (so schema probing works). It raises only on unusable responses. Never echo response bodies.
+- Helper `gql_soft(query, variables)` returns `data` or `None` and never raises.
+
+## 3. Data flow
+
+1. **Latest crawl**: for the selected project, query `getProject(id:$id){ crawls(first:1, filter:{statusEnum:{eq:Finished}}, orderBy:[{field:createdAt, direction:DESC}]){ nodes{ id createdAt } } }`. Cache for 15 minutes.
+2. **Report stats**: `getCrawl(id:$id){ reportStats{ reportTemplateCode basic } }` returns a dict of `code -> int count`. The exact schema may vary, so try ID types `ObjectID!`, `ID!` and `String!`, and a few field selections. Use the first that works, and otherwise raise a clear, scrubbed error.
+
+## 4. Checks and scoring
+
+Ten checks, each with `label, icon, category, severity, codes, value (sum of codes), base`. The ratio is `min(1, value/base)`.
+
+| Check | Category | Severity | Report codes | Base |
+|---|---|---|---|---|
+| Broken Pages | Indexation | Critical | `4xx_errors`, `5xx_errors` | `all_pages` |
+| Indexability Conflicts | Indexation | Critical | `canonicalized_noindexed_pages`, `canonical_to_non_200`, `conflicting_canonical_tags`, `canonical_link_mismatch` | `indexable_pages` |
+| Broken Redirects/Chains/Loops | Indexation | High | `all_broken_redirects`, `redirect_chains`, `redirection_loop` | `all_pages` |
+| Orphaned Pages | Indexation | High | `all_orphaned_pages` | `all_pages` |
+| Sitemap Issues | Indexation | Medium | `broken_sitemap_links`, `sitemaps_broken_disallowed`, `sitemaps_non_indexable_links`, `error_pages_in_sitemaps` | `all_crawled_urls_in_xml_sitemaps` |
+| Missing/Duplicate Titles | Content | Medium | `missing_titles`, `pages_with_duplicate_titles_excl_duplicate_pages` | `all_pages` |
+| H1 Issues | Content | Medium | `missing_h1_tags`, `multiple_h1_tag_pages` | `all_pages` |
+| Structured Data Issues | Content | Medium | `pages_with_review_snippet_schema_issues`, `pages_with_breadcrumb_schema_issues` | `all_crawl_schema_blocks` |
+| Internal Broken Links | Links | High | `all_broken_links` | `unique_internal_links` |
+| Backlink Equity Wasted | Links | High | `backlink_pages_with_errors`, `backlink_pages_redirects`, `backlink_pages_non_indexable` | `all_cralwed_urls_with_backlinks` |
+
+- Keep the `all_cralwed_urls_with_backlinks` spelling. It is the real code.
+- Every base is `max(count, 1)` to avoid division by zero.
+- Weights: Critical 3.0, High 1.5, Medium 0.75. `penalty = weight * ratio`.
+- `score = round(100 * (1 - sum(penalty) / sum(weight)), 1)`.
+- Grades: A >= 90, B >= 80, C >= 70, D >= 60, else F.
+- Tile status by ratio: 0 = Pass, < 5% = Minor, < 20% = Warn, else Fail.
+- Show a sub-score per category.
+- Codes may not exist in every account. A missing code counts as 0 and must never crash the app.
+
+## 5. Single-crawl dashboard (the main view)
+
+- Sidebar: project selector (hidden if there is only one project), API version, and a "Refresh" button that clears caches.
+- KPI row: Overall Score (large, coloured, with grade), Pages Crawled, Failing Checks, and Money Pages At Risk if available.
+- Category Health: one sub-score per category.
+- Issue tiles grouped by severity (Critical, High, Medium) in a 4-column grid. Each tile shows the label, count, "% of base", and a status badge.
+- Each tile with a count above 0 has:
+  - an expander showing the **top 10 URLs**, and
+  - a **"Get all URLs" button** that exports up to 5,000 rows to CSV.
+- A collapsed "Full breakdown" table (check, severity, count, base, ratio, weight, penalty) sorted by penalty, with a green-to-red gradient. Fall back to a `ProgressColumn` if `matplotlib` is missing.
+
+## 6. URL drill-down (schema-tolerant)
+
+Report rows do not all live on `crawlUrls`. Link reports use `crawlLinks` or `crawlUniqueLinks`, and structured-data reports use `crawlStructuredDataBlocks`. Use this approach:
+
+1. Introspect the `ReportStat` type once, in a few aliased queries. Collect its `*Connection` fields, their node types, and each node type's scalar fields. Cache the result in a lock-guarded dict.
+2. Find each report's datasource with `getReportStat(input:{crawlId, reportTemplateCode}){ reportTemplate{ datasourceCodeEnum } }`. Fall back to `CrawlUrls`.
+3. Probe candidate connections with `{ conn { totalCount } }` as independent ops in one JSON-array batch. Pick the first with a non-zero count.
+4. Select a preferred field list per datasource, intersected with the fields the schema actually exposes (for example `url, pageTitle, httpStatusCode, indexable, searchConsoleTotalClicks` for URLs).
+5. Paginate with `first/after` cursors. If an `orderBy` or a field is rejected, retry without it, then with minimal fields.
+6. Wrap this in a thread-safe `fetch_report_rows(...)` that returns `(DataFrame, meta)`, with no Streamlit calls inside. Run top-10 prefetches in a thread pool.
+
+## 7. Money Pages (optional, degrades gracefully)
+
+- Pull the top 20 URLs (30 if the crawl has more than 300 pages) from `all_pages`, sorted by `searchConsoleTotalClicks` descending, falling back to impressions. If Search Console data is unavailable, hide the panel.
+- Audit each URL:
+  - 301/308 redirects are a **note, not an issue**.
+  - 302/303/307 are "temporary redirect" issues.
+  - 4xx and 5xx are critical.
+  - **Skip indexability checks on any 3xx**, because Lumar marks redirects as non-indexable.
+  - Otherwise flag noindex, canonicalised-away, and non-indexable pages.
+- Health labels: At risk / Check / Healthy. The count of At-risk pages feeds an extra Critical check with weight 8.0.
+- Optional "shop pages only" filter driven by a **user-editable list of path keywords to exclude** (for example `blog`, `support`, `legal`, `account`, `cart`). Keep this list in one constant and cap URL length at 2048 before matching. The filter is a view only and never changes the score.
+
+## 8. Portfolio view (only shown when there is more than one project)
+
+- A "Score all projects" button. It makes one aliased request per 8 projects (`p0: getProject(id:$id0){...} p1: ...`) with a fragment that fetches the latest finished crawl plus `reportStats(reportTemplateCodes:$codes)`. Run the chunks in a thread pool. Fall back to per-project resolution if the aliased query fails.
+- Keep every raw count in the result under an `m_` prefix so later rollups cost zero extra requests.
+- Show a table sorted worst to best, with Score and Grade as the leftmost columns. Clicking a row opens that project's detail view. Without `on_select` support, use a selectbox instead.
+- If projects have a `group`, offer a group filter.
+- Optional: a "Sitemap errors" panel summing `error_pages_in_sitemaps` per project. Compute the estate rate as **sum of errors / sum of sitemap URLs**, never an average of per-project rates.
+
+## 9. Security (implement and document in the docstring)
+
+- **CSV injection**: `csv_safe(df)` prefixes `'` to any text cell starting with `= + - @`, tab or CR. Every `to_csv` goes through it.
+- **HTML injection**: `html.escape` every value placed inside `unsafe_allow_html`. Crawled titles and URLs are untrusted.
+- **GraphQL injection**: validate every identifier that enters query text against `^[A-Za-z_][A-Za-z0-9_]{0,63}$`. Validate report codes in string literals against `^[A-Za-z0-9_]{1,64}$` (digits are allowed, since `4xx_errors` is valid).
+- **Secret leakage**: `_scrub(msg)` redacts the API key and any `x-api-key` or `authorization` text from everything shown in the UI, saved to CSV, or logged.
+- **Unsafe links**: prefix `unsafe:` to any URL that is not `http://` or `https://` before it reaches `LinkColumn`.
+- **Rate limits**: add cooldowns on user-triggered fan-outs such as score-all and bulk exports.
+
+## 10. Numeric rules (include as code comments)
+
+- Never guard a division with `series.replace(0, pd.NA)`. It turns the Series into object dtype and breaks `.round()`. Write `_safe_rate(num, den)` that converts to float and uses `.where(den > 0)`.
+- Rates across groups are always `sum(numerator) / sum(denominator)`.
+
+## 11. UI
+
+- `st.set_page_config(layout="wide")`.
+- Support light and dark mode. For neutral text use `color: inherit` and `opacity`. Hardcode colours only for status and severity.
+- Use `st.cache_data` with TTLs (15-30 min). Use `inspect.signature` to detect newer Streamlit features and fall back if they are missing.
+- Never crash on a missing key, a project with no finished crawl, a failed introspection, an empty report, or a rejected GraphQL shape. Show a clear message instead.
+
+## Delivery order (stop and wait for my OK after each phase)
+
+1. Setup, config, security helpers, API layer, project loader, latest-crawl lookup, and a page that prints the raw report stats.
+2. Checks, scoring, KPI row, category scores, tiles (counts only), breakdown table.
+3. Schema introspection, top-10 previews, and CSV exports.
+4. Money Pages audit.
+5. Portfolio view and sitemap panel (skip if I only have one or two projects).
+6. Theming polish and a final security review. List every assumption you made about Lumar's schema so I can verify it.
+
+Start with Phase 1.
